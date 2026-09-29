@@ -98,9 +98,17 @@ export async function autoSyncImage(url: string, resultId: string, storageKey?: 
         try {
             return await uploadRemoteImageToServer(url, "image");
         } catch (error) {
-            if (!url.startsWith("data:") && !url.startsWith("blob:")) throw error;
-            reportStorageSyncFailure(error);
-            return uploadImage(url, { localOnly: true });
+            if (url.startsWith("data:") || url.startsWith("blob:")) {
+                reportStorageSyncFailure(error);
+                return uploadImage(url, { localOnly: true });
+            }
+            // 远端外链：先经同源代理拉取图片数据，落地本地 IndexedDB 兜底；仍失败则保留原 URL 并上报
+            try {
+                const dataUrl = await imageToDataUrl({ url });
+                return await uploadImage(dataUrl, { localOnly: true });
+            } catch {
+                throw error;
+            }
         }
     });
 }

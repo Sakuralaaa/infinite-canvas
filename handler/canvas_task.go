@@ -582,6 +582,11 @@ func imageURLsFromAIResponse(payload []byte, contentType string, collectAll bool
 			if !strings.HasPrefix(candidate, "data:image/") {
 				url = "data:" + mimeType + ";base64," + candidate
 			}
+		} else if data, detectedMimeType, err := downloadRemoteImageBytes(candidate); err == nil && len(data) > 0 {
+			// 远端 URL 立即下载为内联数据，避免外链过期或需要鉴权导致图片无法显示；失败时保留原 URL 兜底
+			url = "data:" + detectedMimeType + ";base64," + base64.StdEncoding.EncodeToString(data)
+			mimeType = detectedMimeType
+			bytes = int64(len(data))
 		}
 		if seen[url] {
 			continue
@@ -690,11 +695,18 @@ func collectImageCandidates(value any, depth int, includeChatImages bool) []stri
 		}
 		return result
 	case map[string]any:
-		keys := []string{"url", "b64_json", "partial_image_b64", "image_url", "image", "image_data", "base64", "inlineData", "parts", "content", "candidates", "result", "response", "data", "output"}
+		var result []string
+		// base64 数据优先于 url：同一张图同时返回两个字段时优先取自包含数据，避免外链失效或需要鉴权导致裂图
+		for _, key := range []string{"b64_json", "base64", "image_data", "partial_image_b64"} {
+			result = append(result, collectImageCandidates(typed[key], depth+1, includeChatImages)...)
+		}
+		keys := []string{"image_url", "image", "inlineData", "parts", "content", "candidates", "result", "response", "data", "output"}
+		if len(result) == 0 {
+			keys = append([]string{"url"}, keys...)
+		}
 		if includeChatImages {
 			keys = append(keys, "choices", "message", "images")
 		}
-		var result []string
 		for _, key := range keys {
 			result = append(result, collectImageCandidates(typed[key], depth+1, includeChatImages)...)
 		}
@@ -737,6 +749,32 @@ func imageCandidateBytes(value string) ([]byte, string, error) {
 		return nil, "", err
 	}
 	return data, http.DetectContentType(data), nil
+}
+
+func downloadRemoteImageBytes(target string) ([]byte, string, error) {
+	request, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	request.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	request.Header.Set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+	response, err := service.SafeProxyHTTPClient().Do(request)
+	if err != nil {
+		return nil, "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, "", errors.New(response.Status)
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, 32*1024*1024))
+	if err != nil {
+		return nil, "", err
+	}
+	mimeType := response.Header.Get("Content-Type")
+	if mimeType == "" {
+		mimeType = http.DetectContentType(data)
+	}
+	return data, strings.Split(mimeType, ";")[0], nil
 }
 
 func imageSize(data []byte) (int, int) {

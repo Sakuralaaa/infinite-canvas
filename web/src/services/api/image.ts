@@ -245,25 +245,34 @@ function normalizeBase64Image(value: string, fallbackMime: string) {
     return value.startsWith("data:") ? value : `data:${fallbackMime};base64,${value}`;
 }
 
-function resolveImageDataUrl(item: Record<string, unknown>, mime: string) {
+function hasImageDataPayload(item: Record<string, unknown>) {
+    return Boolean((typeof item.b64_json === "string" && item.b64_json) || (typeof item.url === "string" && item.url));
+}
+
+async function downloadRemoteImageDataUrl(url: string) {
+    try {
+        return await imageToDataUrl({ url });
+    } catch {
+        return url;
+    }
+}
+
+async function resolveImageDataUrl(item: Record<string, unknown>, mime: string) {
     if (typeof item.b64_json === "string" && item.b64_json) {
         return normalizeBase64Image(item.b64_json, mime);
     }
     if (typeof item.url === "string" && item.url) {
-        return item.url;
+        return item.url.startsWith("data:") ? item.url : await downloadRemoteImageDataUrl(item.url);
     }
     return null;
 }
 
-function parseImagePayload(payload: ImageApiResponse, mime: string): GeneratedImage[] {
+async function parseImagePayload(payload: ImageApiResponse, mime: string): Promise<GeneratedImage[]> {
     if (typeof payload.code === "number" && payload.code !== 0) {
         throw new ImageRequestError(payload.msg || "请求失败", payload);
     }
-    const images =
-        payload.data
-            ?.map((item) => resolveImageDataUrl(item, mime))
-            .filter((value): value is string => Boolean(value))
-            .map((dataUrl) => ({ id: nanoid(), dataUrl })) || [];
+    const dataUrls = (await Promise.all((payload.data || []).map((item) => resolveImageDataUrl(item, mime)))).filter((value): value is string => Boolean(value));
+    const images = dataUrls.map((dataUrl) => ({ id: nanoid(), dataUrl }));
 
     if (images.length === 0) {
         throw new ImageRequestError("接口没有返回图片", payload);
@@ -272,14 +281,15 @@ function parseImagePayload(payload: ImageApiResponse, mime: string): GeneratedIm
     return images;
 }
 
-function parseChatImagesPayload(payload: ChatImagesApiResponse): GeneratedImage[] {
+async function parseChatImagesPayload(payload: ChatImagesApiResponse): Promise<GeneratedImage[]> {
     if (typeof payload.code === "number" && payload.code !== 0) throw new ImageRequestError(payload.msg || "请求失败", payload);
     if (payload.error?.message) throw new ImageRequestError(payload.error.message, payload);
-    const images = payload.choices
+    const urls = payload.choices
         ?.flatMap((choice) => choice.message?.images || [])
         .map((item) => item.image_url?.url || "")
-        .filter(Boolean)
-        .map((dataUrl) => ({ id: nanoid(), dataUrl })) || [];
+        .filter(Boolean) || [];
+    const dataUrls = await Promise.all(urls.map(async (url) => (url.startsWith("data:") ? url : await downloadRemoteImageDataUrl(url))));
+    const images = dataUrls.filter(Boolean).map((dataUrl) => ({ id: nanoid(), dataUrl }));
     if (!images.length) throw new ImageRequestError("Chat Completions 没有返回图片", payload);
     return images;
 }
@@ -465,14 +475,14 @@ async function parseImagesStreamResponse(response: Response, mime: string): Prom
         if (object === "image.generation.result" || object === "image.edit.result") {
             resultPayload = event as ImageApiResponse;
         }
-        if (resolveImageDataUrl(event, mime)) {
+        if (hasImageDataPayload(event)) {
             const imageIndex =
                 typeof event.image_index === "number" || typeof event.image_index === "string" ? String(event.image_index) : `event-${imageItems.size}`;
             imageItems.set(imageIndex, event);
         }
     });
-    if (resultPayload) return parseImagePayload(resultPayload, mime);
-    if (imageItems.size) return parseImagePayload({ data: Array.from(imageItems.values()) }, mime);
+    if (resultPayload) return await parseImagePayload(resultPayload, mime);
+    if (imageItems.size) return await parseImagePayload({ data: Array.from(imageItems.values()) }, mime);
     throw new ImageRequestError("流式接口未返回最终图片数据", events);
 }
 
@@ -677,7 +687,7 @@ async function requestImageGenerationSingle(config: AiConfig & { seedIndex?: num
                     return { images, responseBody: summarizeGeneratedImages(images, "event-stream") };
                 }
                 const payload = (await response.json()) as ImageApiResponse;
-                const images = parseImagePayload(payload, mime);
+                const images = await parseImagePayload(payload, mime);
                 return { images, responseBody: stringifyLogPayload(payload) };
             },
         );
@@ -693,7 +703,7 @@ async function requestImageGenerationSingle(config: AiConfig & { seedIndex?: num
     const directProvider = !usesAccountProxy(config) ? directAIProviderForConfig(config) : null;
     if (directProvider) {
         const { requestDirectImages } = await import("@/services/api/direct-ai");
-        return parseImagePayload(await requestDirectImages(config, directProvider, "/images/generations", body, params.timeoutSeconds), mime);
+        return await parseImagePayload(await requestDirectImages(config, directProvider, "/images/generations", body, params.timeoutSeconds), mime);
     }
 
     return requestAndParseImages(
@@ -718,7 +728,7 @@ async function requestImageGenerationSingle(config: AiConfig & { seedIndex?: num
                 return { images, responseBody: summarizeGeneratedImages(images, "event-stream") };
             }
             const payload = (await response.json()) as ImageApiResponse;
-            return { images: parseImagePayload(payload, mime), responseBody: stringifyLogPayload(payload) };
+            return { images: await parseImagePayload(payload, mime), responseBody: stringifyLogPayload(payload) };
         },
     );
 }
@@ -764,7 +774,7 @@ async function requestGrokImageEditSingle(config: AiConfig, prompt: string, refe
                 return { images, responseBody: summarizeGeneratedImages(images, "event-stream") };
             }
             const payload = (await response.json()) as ImageApiResponse;
-            return { images: parseImagePayload(payload, mime), responseBody: stringifyLogPayload(payload) };
+            return { images: await parseImagePayload(payload, mime), responseBody: stringifyLogPayload(payload) };
         },
     );
 }
@@ -791,7 +801,7 @@ async function requestImageEditSingle(config: AiConfig, prompt: string, referenc
     const directProvider = !usesAccountProxy(config) ? directAIProviderForConfig(config) : null;
     if (directProvider) {
         const { requestDirectImages } = await import("@/services/api/direct-ai");
-        return parseImagePayload(await requestDirectImages(config, directProvider, "/images/edits", formData, params.timeoutSeconds), mime);
+        return await parseImagePayload(await requestDirectImages(config, directProvider, "/images/edits", formData, params.timeoutSeconds), mime);
     }
 
     return requestAndParseImages(
@@ -816,7 +826,7 @@ async function requestImageEditSingle(config: AiConfig, prompt: string, referenc
                 return { images, responseBody: summarizeGeneratedImages(images, "event-stream") };
             }
             const payload = (await response.json()) as ImageApiResponse;
-            return { images: parseImagePayload(payload, mime), responseBody: stringifyLogPayload(payload) };
+            return { images: await parseImagePayload(payload, mime), responseBody: stringifyLogPayload(payload) };
         },
     );
 }
@@ -922,7 +932,7 @@ async function requestChatImagesSingle(config: AiConfig, prompt: string, inputIm
         }))),
         async (response) => {
             const payload = await response.json() as ChatImagesApiResponse;
-            return { images: parseChatImagesPayload(payload), responseBody: stringifyLogPayload(payload) };
+            return { images: await parseChatImagesPayload(payload), responseBody: stringifyLogPayload(payload) };
         },
     );
 }
@@ -1515,7 +1525,7 @@ async function requestAgnesImageEdit(config: AiConfig & { seedIndex?: number; se
                 return { images, responseBody: summarizeGeneratedImages(images, "event-stream") };
             }
             const payload = (await response.json()) as ImageApiResponse;
-            const images = parseImagePayload(payload, mime);
+            const images = await parseImagePayload(payload, mime);
             return { images, responseBody: stringifyLogPayload(payload) };
         },
     );
