@@ -9,20 +9,21 @@ permissions:
   contents: read
   packages: write
 
-env:
-  IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 jobs:
   meta:
     runs-on: ubuntu-latest
     outputs:
+      image: ${{ steps.names.outputs.image }}
       tags: ${{ steps.meta.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
     steps:
+      - id: names
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ steps.names.outputs.image }}
           tags: |
             type=ref,event=tag
             type=sha,prefix=
@@ -57,7 +58,7 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           labels: ${{ needs.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ needs.meta.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=app-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=app-${{ matrix.arch }}
 
@@ -99,6 +100,7 @@ jobs:
         shell: bash
         env:
           TAGS: ${{ needs.meta.outputs.tags }}
+          IMAGE_NAME: ${{ needs.meta.outputs.image }}
         run: |
           tag_args=()
           while IFS= read -r tag; do
